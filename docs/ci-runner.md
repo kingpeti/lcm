@@ -58,3 +58,20 @@ home whose `config.json` names another port, and `test/setup-port-guard.mjs`
 refuses the default port (`LCM_TEST_GUARDED_PORTS`) in every Node process the
 suite runs, logging each refusal under `LCM_TEST_GUARD_DIR` and failing the test
 file that made it. `test/port-guard.test.ts` holds both in place.
+
+A developer's temp directory is shared with the live hooks' session claims, restore locks
+and snapshots, so tests do not write there either. `test/setup-global.ts` makes one run root
+(`lv-*`) per vitest project in the temp directory the run started with, and
+`test/setup-env.ts` gives each test file its own directory inside it (`f-*`), pointing
+`TMPDIR`, `TMP` and `TEMP` there for the file and every child it spawns.
+`GIT_CEILING_DIRECTORIES` names the run root, so Git never looks above it for a repository.
+Each file removes its directory when it finishes, and the run removes the root at teardown.
+What cannot be removed, typically a file Windows still holds open, fails the run when `CI`
+is set and is reported as a warning locally. `LCM_TEST_KEEP_TMP=1` keeps the root and each
+file's directory in it, with whatever that file's tests left there, for debugging; the lcm
+home, HOME and other directories the setup itself makes are still removed.
+`test/temp-isolation.test.ts` holds this in place. vitest's own cache
+(`cacheDir` in `vitest.config.ts`) stays in the real temp directory. The two levels add
+about 20 characters to every temp path: on Windows a `TEMP` longer than about 115
+characters pushes the deepest test databases past `MAX_PATH`, and SQLite answers
+"unable to open database file".

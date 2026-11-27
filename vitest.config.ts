@@ -18,6 +18,7 @@ export default defineConfig({
           include: ["test/**/*.test.ts"],
           exclude: ["test/e2e/**", "node_modules/**", ".claude/**"],
           setupFiles: ["./test/setup-dist.ts", "./test/setup-env.ts"],
+          globalSetup: ["./test/setup-global.ts"],
           // CI machines are shared: setup-heavy tests that take 1–3 s
           // idle exceed vitest's 5 s default under load. A real hang still fails.
           testTimeout: 20_000,
@@ -31,6 +32,7 @@ export default defineConfig({
           include: ["test/e2e/**/*.test.ts"],
           exclude: ["node_modules/**", ".claude/**"],
           setupFiles: ["./test/setup-dist.ts", "./test/setup-env.ts"],
+          globalSetup: ["./test/setup-global.ts"],
           // E2E tests spin up real daemons backed by SQLite — must run
           // sequentially to avoid concurrent write conflicts.
           fileParallelism: false,

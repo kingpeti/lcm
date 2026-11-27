@@ -3,14 +3,33 @@ import { createServer } from "node:net";
 import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { afterAll } from "vitest";
+import { afterAll, inject } from "vitest";
 import { assertIsolatedTestHome, lcmHome } from "../src/lcm-home.js";
 import { createLcmPaths } from "../src/lcm-paths.js";
+import { finishFileTmpDir } from "./setup-global.js";
 
 // OS identity is independent of HOME and LCM_HOME inherited from the runner.
 // Retain it in children so their later environment changes cannot select real stores.
 process.env.LCM_TEST_REAL_HOME = join(userInfo().homedir, ".lossless-claude");
 assertIsolatedTestHome(tmpdir()); // Reject a protected temporary base before allocating any directory.
+
+// The real temp dir is shared with the live hooks' session claims, restore locks and snapshots.
+// This file's temp dir is its own, inside the run root test/setup-global.ts made, so nothing a
+// test or its children write to os.tmpdir() lands beside them: POSIX reads TMPDIR, Windows TEMP
+// and TMP. Set first, so every directory below is allocated inside it. Git stops looking for a
+// repository at the run root, so a temp dir that sits inside a checkout cannot lend its repo to
+// a test.
+process.env.LCM_TEST_REAL_TMPDIR ??= tmpdir();
+const runRoot = inject("lcmTestRunRoot");
+if (!runRoot) throw new Error("[lcm test temp] no run root: run the suite through vitest.config.ts, whose globalSetup makes it");
+const fileTmpDir = mkdtempSync(join(runRoot, "f-"));
+process.env.TMPDIR = fileTmpDir;
+process.env.TMP = fileTmpDir;
+process.env.TEMP = fileTmpDir;
+process.env.GIT_CEILING_DIRECTORIES = runRoot;
+if (tmpdir() !== fileTmpDir) throw new Error(`[lcm test temp] os.tmpdir() is ${tmpdir()}, not ${fileTmpDir}`);
+assertIsolatedTestHome(tmpdir());
+afterAll(() => finishFileTmpDir(fileTmpDir));
 
 // Everything lcm stores goes to a directory this file owns, so no test can reach the
 // developer's real memory — and, because each test file gets its own, two files cannot
