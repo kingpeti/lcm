@@ -78,6 +78,12 @@ const MAX_BODY_BYTES = 10 * 1024 * 1024; // 10 MB
 // Routes whose request line is noise at info: per tool call, per poll, per health probe.
 const DEBUG_ROUTES = new Set(["POST /tool-event", "GET /health", "GET /summarize-jobs/next"]);
 
+// Routes whose hooks wait for the answer: a client gone before the answer is a hook that gave up
+// at its own timeout. One that gives up but keeps the connection open (the function-hooks module)
+// finishes normally and is not seen here. Other hooks drop their socket by design, so a trace for
+// them would be noise.
+const ABORT_LOGGED_ROUTES = new Set(["POST /ingest", "POST /prompt-search", "POST /restore"]);
+
 function requestLevel(key: string, status: number): LogLevel {
   if (status >= 500) return "error";
   if (status >= 400) return "warn";
@@ -271,11 +277,10 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     inFlight.add(current);
     res.on("close", () => {
       current.ended = Date.now();
-      // A client gone before the answer leaves no `request` record. Claude hooks wait for an ingest,
-      // other hooks drop their socket by design. OMP posts ingests fire-and-forget too, so this is
-      // `info`, not a fault. A status-free event of its own keeps deploy checks that read `request`
-      // with status 200 as a landed ingest from counting it.
-      if (key === "POST /ingest" && !res.writableFinished) {
+      // A client gone before the answer leaves no `request` record. OMP posts ingests fire-and-forget
+      // too, so this is `info`, not a fault. A status-free event of its own keeps deploy checks that
+      // read `request` with status 200 as a landed ingest from counting it.
+      if (ABORT_LOGGED_ROUTES.has(key) && !res.writableFinished) {
         log.write("info", "request.aborted", { route: key, ms: Date.now() - started, ...identity });
       }
     });

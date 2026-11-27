@@ -68,22 +68,22 @@ async function until(condition: () => boolean): Promise<void> {
   }
 }
 
-it("logs request.aborted once, without a status, for an ingest whose client left before the answer", async () => {
+it.each(["/ingest", "/prompt-search", "/restore"])("logs request.aborted once, without a status, for a %s whose client left before the answer", async (path) => {
   const { port, records } = await start();
   const held = heldRoute();
-  daemon?.registerRoute("POST", "/ingest", held.handler);
-  await abandon(port, "/ingest", held.entered);
+  daemon?.registerRoute("POST", path, held.handler);
+  await abandon(port, path, held.entered);
   await until(() => records().some((record) => record.event === "request.aborted"));
   held.release();
   await new Promise((resolve) => setTimeout(resolve, FINISH_FLUSH_MS));
 
   const aborted = records().filter((record) => record.event === "request.aborted");
   expect(aborted).toHaveLength(1);
-  expect(aborted[0]).toMatchObject({ level: "info", route: "POST /ingest", session_id: "s1", cwd: "/work/p" });
+  expect(aborted[0]).toMatchObject({ level: "info", route: `POST ${path}`, session_id: "s1", cwd: "/work/p" });
   expect(aborted[0].ms).toEqual(expect.any(Number));
   expect(aborted[0]).not.toHaveProperty("status");
-  // Nothing reads as a landed ingest: the answer written after the client left never finishes.
-  expect(records().filter((record) => record.event === "request" && record.route === "POST /ingest")).toEqual([]);
+  // Nothing reads as a landed request: the answer written after the client left never finishes.
+  expect(records().filter((record) => record.event === "request" && record.route === `POST ${path}`)).toEqual([]);
 });
 
 it("does not log request.aborted for another route whose client leaves early", async () => {
