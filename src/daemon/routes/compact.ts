@@ -114,6 +114,15 @@ const compactingNow = new Map<string, InFlightCompaction>();
  */
 const ESTIMATED_SUMMARY_CALL_MS = 30_000;
 
+/**
+ * Left of `reply_budget_ms` when a summary still running stops being waited for: time to
+ * take the project lease, mark the session for the restore that follows, and answer 202.
+ */
+const REPLY_BUDGET_MARGIN_MS = 3_000;
+
+/** The longest delay a timer honours; Node runs a longer one after 1 ms, ending the budget's waits at once. */
+const MAX_REPLY_BUDGET_MS = 2_147_483_647;
+
 type SummaryEstimate = { calls: number; rawTokens: number };
 
 /** Leaf calls for the raw backlog outside the fresh tail, plus one condensed call. */
@@ -374,6 +383,7 @@ export function createCompactHandler(config: DaemonConfig, paths: LcmPaths, jobs
     let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
     let deadlineAt: number | undefined;
     let deadlineReplied = false;
+    let budgetTimer: ReturnType<typeof setTimeout> | undefined;
     const reply = createCompactionReply(res, input.session_id, input.render_context === true);
     let cwdForObservation: string | undefined;
     let captureOutcomeForError: { status: "completed"; messages: number } | { status: "failed"; reason: string } | undefined;
@@ -393,10 +403,12 @@ export function createCompactHandler(config: DaemonConfig, paths: LcmPaths, jobs
       reply(400, { error: "render_context requires Claude Capture, a UUID boundary and a byte budget of 1..65536" }); return;
     }
     // The caller's wait for a summary. A run estimated not to fit is answered 202 once
-    // captured and keeps compacting after the reply.
+    // captured, and one still summarizing when the budget is about to run out is answered
+    // 202 then; both keep compacting after the reply.
     const replyBudgetMs: unknown = input.reply_budget_ms;
-    if (replyBudgetMs !== undefined && (renderContext || !Number.isSafeInteger(replyBudgetMs) || (replyBudgetMs as number) <= 0)) {
-      reply(400, { error: "reply_budget_ms must be a positive integer and cannot be combined with render_context" }); return;
+    if (replyBudgetMs !== undefined && (renderContext || !Number.isSafeInteger(replyBudgetMs)
+        || (replyBudgetMs as number) <= 0 || (replyBudgetMs as number) > MAX_REPLY_BUDGET_MS)) {
+      reply(400, { error: `reply_budget_ms must be an integer of 1..${MAX_REPLY_BUDGET_MS} and cannot be combined with render_context` }); return;
     }
     // Unforced runs leave the engine's own thresholds in charge; the live leaf trigger sends them.
     if (input.force !== undefined && typeof input.force !== "boolean") {
@@ -512,6 +524,30 @@ export function createCompactHandler(config: DaemonConfig, paths: LcmPaths, jobs
       }
     };
 
+    // An estimate can miss: a stalled host or a slow model call still ends in the same 202
+    // before the budget runs out, rather than in a hook the host kills. The run goes on.
+    let markedForRestore = false;
+    const expireReplyBudget = async (captureOutcome: CaptureStage | undefined) => {
+      // An over-budget reply already marked the session and answered.
+      if (markedForRestore) return;
+      markedForRestore = true;
+      // Between two model calls the run holds the lease; the reply cannot wait for it.
+      if (!await settlesWithin(markCompactedForRestore(), REPLY_BUDGET_MARGIN_MS)) {
+        log.write("warn", "precompact.mark_failed", { cwd, session_id, reason: "lease-timeout" });
+      }
+      if (reply(202, { summary: "", captureOutcome, summaryOutcome: { status: "deferred", reason: "budget-expired" } })) {
+        log.write("info", "precompact.deferred", { cwd, session_id, reason: "budget-expired",
+          budget_ms: replyBudgetMs, elapsed_ms: Date.now() - startedAt });
+      }
+    };
+    const watchReplyBudget = (budgetMs: number, captureOutcome: CaptureStage | undefined) => {
+      // A later Capture re-arms it for the same instant, so the 202 reports what both stored.
+      clearTimeout(budgetTimer);
+      budgetTimer = setTimeout(() => { void expireReplyBudget(captureOutcome); },
+        Math.max(0, startedAt + budgetMs - REPLY_BUDGET_MARGIN_MS - Date.now()));
+      budgetTimer.unref();
+    };
+
     const skipBusy = async (captured?: CaptureStage) => {
       log.write("info", "compact.skipped", { cwd, session_id, reason: "project-busy" });
       const captureOutcome = captureRequired ? captured ?? (await captureOnly()).outcome : undefined;
@@ -548,7 +584,7 @@ export function createCompactHandler(config: DaemonConfig, paths: LcmPaths, jobs
         const waitMs = replyBudgetMs - (Date.now() - startedAt) - ESTIMATED_SUMMARY_CALL_MS;
         if (outcome.status === "completed" && estimate) {
           if (estimate.calls * ESTIMATED_SUMMARY_CALL_MS > waitMs) {
-            log.write("info", "precompact.deferred", { cwd, session_id, estimated_calls: estimate.calls,
+            log.write("info", "precompact.deferred", { cwd, session_id, reason: "over-budget", estimated_calls: estimate.calls,
               raw_tokens: estimate.rawTokens, remaining_ms: waitMs + ESTIMATED_SUMMARY_CALL_MS, in_flight: true });
             log.write("info", "precompact.summary", { cwd, session_id, status: "deferred", reason: "over-budget" });
             recordPrecompactStages({ cwd, sessionId: session_id, client, operationId, capture: outcome,
@@ -557,6 +593,7 @@ export function createCompactHandler(config: DaemonConfig, paths: LcmPaths, jobs
             reply(202, { summary: "", captureOutcome: outcome, summaryOutcome: { status: "deferred", reason: "over-budget" } });
             return;
           }
+          watchReplyBudget(replyBudgetMs, outcome);
           if (await settlesWithin(inFlight.finished, waitMs)) continue;
         }
       }
@@ -625,7 +662,6 @@ export function createCompactHandler(config: DaemonConfig, paths: LcmPaths, jobs
 
         return withProjectMutation(pid, async (lease) => {
         const db = getLcmConnection(dbPath);
-        let markedForRestore = false;
         try {
           controller.signal.throwIfAborted();
           runLcmMigrations(db);
@@ -714,13 +750,17 @@ export function createCompactHandler(config: DaemonConfig, paths: LcmPaths, jobs
           if (typeof replyBudgetMs === "number") {
             const estimate = await estimateSummaryCalls(capture, conversation.conversationId);
             const remainingMs = replyBudgetMs - (Date.now() - startedAt);
-            if (estimate.calls * ESTIMATED_SUMMARY_CALL_MS > remainingMs) {
-              log.write("info", "precompact.deferred", { cwd, session_id, estimated_calls: estimate.calls,
+            // A watchdog that fired during the queue, lease or Capture waits, or this estimate,
+            // has answered and marked already: one request, one deferral and one mark.
+            if (!markedForRestore && estimate.calls * ESTIMATED_SUMMARY_CALL_MS > remainingMs) {
+              log.write("info", "precompact.deferred", { cwd, session_id, reason: "over-budget", estimated_calls: estimate.calls,
                 raw_tokens: estimate.rawTokens, remaining_ms: remainingMs });
               // The restore that follows this PreCompact runs long before the summary ends.
               markSessionCompacted(db, session_id);
               markedForRestore = true;
               reply(202, { summary: "", captureOutcome, summaryOutcome: { status: "deferred", reason: "over-budget" } });
+            } else if (!markedForRestore) {
+              watchReplyBudget(replyBudgetMs, captureOutcome);
             }
           }
 
@@ -1044,6 +1084,9 @@ export function createCompactHandler(config: DaemonConfig, paths: LcmPaths, jobs
 
     } catch (error) {
       if (!(error instanceof CompactionDeadlineError)) throw error;
-    } finally { if (deadlineTimer) clearTimeout(deadlineTimer); }
+    } finally {
+      if (deadlineTimer) clearTimeout(deadlineTimer);
+      if (budgetTimer) clearTimeout(budgetTimer);
+    }
   };
 }

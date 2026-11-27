@@ -1,4 +1,5 @@
 import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import type { IncomingMessage } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -16,6 +17,8 @@ import { clearReplayState, createReplayRun, replaySessionsToClear } from "../../
 import { EventsDb } from "../../../src/hooks/events-db.js";
 import { wasSessionJustCompacted } from "../../../src/db/session-compactions.js";
 import { eventsDbPath } from "../../../src/db/events-path.js";
+import { SessionCapture } from "../../../src/capture.js";
+import { noopDaemonLog, type DaemonLog } from "../../../src/daemon/log.js";
 
 const paths = createLcmPaths(lcmHome());
 
@@ -1876,7 +1879,8 @@ describe("PreCompact reply budget", () => {
     expect(reply.body.summaryOutcome).toMatchObject({ status: "completed" });
   });
 
-  it.each([0, -1, 1.5, "110000"])("rejects reply_budget_ms %j", async (budget) => {
+  // 2147483648 ms is past the longest delay a timer honours.
+  it.each([0, -1, 1.5, "110000", 2_147_483_648])("rejects reply_budget_ms %j", async (budget) => {
     const { res, replied } = replyRecorder();
     await createCompactHandler(makeConfig("openai"), paths)({} as any, res, JSON.stringify({
       session_id: "bad-budget", cwd: tmpdir(), capture_required: true, reply_budget_ms: budget,
@@ -1905,7 +1909,7 @@ describe("PreCompact reply budget", () => {
     }
   });
 
-  async function startIncrementalRun(sessionId: string) {
+  async function startIncrementalRun(sessionId: string, log: DaemonLog = noopDaemonLog) {
     const cwd = mkdtempSync(join(tmpdir(), `lcm-${sessionId}-`));
     dirs.push(cwd);
     const transcriptPath = writeBacklog(cwd, sessionId);
@@ -1916,7 +1920,7 @@ describe("PreCompact reply budget", () => {
       await resume.promise;
       return "summary of an incremental leaf";
     });
-    const handler = createCompactHandler(makeConfig("openai"), paths);
+    const handler = createCompactHandler(makeConfig("openai"), paths, undefined, log);
     const incremental = handler({} as any, replyRecorder().res, JSON.stringify({
       session_id: sessionId, cwd, transcript_path: transcriptPath, force: false,
     }));
@@ -1983,7 +1987,8 @@ describe("PreCompact reply budget", () => {
   it.each([20_000, 100_000])("answers 202 at once when an incremental run cannot finish within a %i ms budget", async (budget) => {
     vi.stubEnv("LCM_LEAF_CHUNK_TOKENS", "1000");
     const sessionId = `no-room-incremental-${budget}`;
-    const run = await startIncrementalRun(sessionId);
+    const log = { ...noopDaemonLog, write: vi.fn<DaemonLog["write"]>() };
+    const run = await startIncrementalRun(sessionId, log);
     try {
       const { res, replied } = replyRecorder();
       const begin = Date.now();
@@ -1997,6 +2002,9 @@ describe("PreCompact reply budget", () => {
       expect(reply.status).toBe(202);
       expect(reply.body.captureOutcome).toMatchObject({ status: "completed", messages: 1 });
       expect(reply.body.summaryOutcome).toMatchObject({ status: "deferred", reason: "over-budget" });
+      expect(log.write).toHaveBeenCalledWith("info", "precompact.deferred", expect.objectContaining({
+        session_id: sessionId, reason: "over-budget", in_flight: true,
+      }));
       expect(justCompacted(run.cwd, sessionId)).toBe(true);
       const observations = new EventsDb(eventsDbPath(run.cwd, paths));
       try {
@@ -2013,6 +2021,416 @@ describe("PreCompact reply budget", () => {
       vi.unstubAllEnvs();
     }
   }, 15_000);
+
+  describe("when the reply budget runs out mid-summary", () => {
+    const request = {} as IncomingMessage;
+    const recordingLog = () => ({ ...noopDaemonLog, write: vi.fn<DaemonLog["write"]>() });
+    const deferrals = (log: ReturnType<typeof recordingLog>) => log.write.mock.calls
+      .filter(([, event]) => event === "precompact.deferred").map(([, , fields]) => fields);
+    // The handler's timers and its clock are faked, so the budget it spends is the test's alone;
+    // SQLite, setImmediate yields and promises stay real.
+    const fakeHandlerTimers = () => vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    // A test that times out skips its finally; later tests must not inherit its fake clock.
+    afterEach(() => {
+      vi.useRealTimers();
+      vi.unstubAllEnvs();
+    });
+
+    it("answers 202 during a model call after marking the session, then stores the summary", async () => {
+      const cwd = mkdtempSync(join(tmpdir(), "lcm-budget-expired-call-"));
+      dirs.push(cwd);
+      const transcriptPath = writeBacklog(cwd, "expired-call");
+      const entered = Promise.withResolvers<void>();
+      const resume = Promise.withResolvers<void>();
+      vi.mocked(createOpenAISummarizer).mockReturnValueOnce(async () => {
+        entered.resolve();
+        await resume.promise;
+        return "summary finished after the reply";
+      });
+      const log = recordingLog();
+      const { res, replied } = replyRecorder();
+      fakeHandlerTimers();
+      const compacting = createCompactHandler(makeConfig("openai"), paths, undefined, log)(request, res, JSON.stringify({
+        session_id: "expired-call", cwd, transcript_path: transcriptPath, capture_required: true, reply_budget_ms: 600_000,
+      }));
+      try {
+        await Promise.race([entered.promise, compacting.then(() => { throw new Error("handler ended before its model call"); })]);
+        // Answered 3 s before the budget runs out, not at the budget itself.
+        await vi.advanceTimersByTimeAsync(600_000 - 3_000 - 1);
+        expect(res.end).not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(1);
+        expect(res.end).toHaveBeenCalledTimes(1);
+        const reply = await replied;
+        expect(reply.status).toBe(202);
+        expect(reply.body).toMatchObject({
+          captureOutcome: { status: "completed", messages: 20 },
+          summaryOutcome: { status: "deferred", reason: "budget-expired" },
+        });
+        // The restore after this PreCompact runs while the summary is still being written.
+        expect(justCompacted(cwd, "expired-call")).toBe(true);
+        expect(await readSummaryCount(cwd, "expired-call")).toBe(0);
+      } finally {
+        resume.resolve();
+        await compacting;
+        vi.useRealTimers();
+      }
+      expect(res.end).toHaveBeenCalledTimes(1);
+      expect(await readSummaryCount(cwd, "expired-call")).toBeGreaterThan(0);
+      expect(log.write).toHaveBeenCalledWith("info", "precompact.deferred", expect.objectContaining({
+        session_id: "expired-call", reason: "budget-expired", budget_ms: 600_000, elapsed_ms: 600_000 - 3_000,
+      }));
+      expect(log.write).toHaveBeenCalledWith("info", "compact.done", expect.objectContaining({ session_id: "expired-call" }));
+      expect(log.write).not.toHaveBeenCalledWith("warn", "precompact.mark_failed", expect.anything());
+      const observations = new EventsDb(eventsDbPath(cwd, paths));
+      try {
+        expect(observations.getHookObservationSummary("expired-call")).toEqual(expect.arrayContaining([
+          expect.objectContaining({ operation: "summary", status: "completed", count: 1 }),
+        ]));
+      } finally {
+        observations.close();
+      }
+    }, 15_000);
+
+    it("answers 202 without waiting past the margin for a lease the run holds between two calls", async () => {
+      vi.stubEnv("LCM_LEAF_CHUNK_TOKENS", "1000");
+      const cwd = mkdtempSync(join(tmpdir(), "lcm-budget-expired-lease-"));
+      dirs.push(cwd);
+      const transcriptPath = writeBacklog(cwd, "expired-lease");
+      let calls = 0;
+      vi.mocked(createOpenAISummarizer).mockReturnValueOnce(async () => {
+        calls += 1;
+        return `leaf summary ${calls}`;
+      });
+      const holding = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const replaceRange = SummaryStore.prototype.replaceContextRangeWithSummary;
+      let published = 0;
+      const publish = vi.spyOn(SummaryStore.prototype, "replaceContextRangeWithSummary").mockImplementation(
+        async function (this: SummaryStore, ...args: Parameters<SummaryStore["replaceContextRangeWithSummary"]>) {
+          await replaceRange.apply(this, args);
+          // After the first leaf the run keeps the lease, before its next model call yields it.
+          published += 1;
+          if (published === 1) {
+            holding.resolve();
+            await release.promise;
+          }
+        });
+      const log = recordingLog();
+      const { res, replied } = replyRecorder();
+      fakeHandlerTimers();
+      const compacting = createCompactHandler(makeConfig("openai"), paths, undefined, log)(request, res, JSON.stringify({
+        session_id: "expired-lease", cwd, transcript_path: transcriptPath, capture_required: true, reply_budget_ms: 600_000,
+      }));
+      try {
+        await Promise.race([holding.promise, compacting.then(() => { throw new Error("handler ended before its first leaf"); })]);
+        // The mark waits for the lease through the 3 s margin, and no longer.
+        await vi.advanceTimersByTimeAsync(600_000 - 1);
+        expect(res.end).not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(1);
+        expect(res.end).toHaveBeenCalledTimes(1);
+        const reply = await replied;
+        expect(reply.status).toBe(202);
+        expect(reply.body).toMatchObject({ summaryOutcome: { status: "deferred", reason: "budget-expired" } });
+        expect(log.write).toHaveBeenCalledWith("warn", "precompact.mark_failed", expect.objectContaining({
+          session_id: "expired-lease", reason: "lease-timeout",
+        }));
+        expect(justCompacted(cwd, "expired-lease")).toBe(false);
+      } finally {
+        release.resolve();
+        await compacting;
+        publish.mockRestore();
+        vi.useRealTimers();
+        vi.unstubAllEnvs();
+      }
+      expect(res.end).toHaveBeenCalledTimes(1);
+      expect(calls).toBeGreaterThan(1);
+      // The mark queued behind the lease lands once the run yields it for its next call.
+      expect(justCompacted(cwd, "expired-lease")).toBe(true);
+      expect(log.write).toHaveBeenCalledWith("info", "compact.done", expect.objectContaining({ session_id: "expired-lease" }));
+    }, 15_000);
+
+    it("arms at the early Capture of a PreCompact that waited out an incremental run", async () => {
+      vi.stubEnv("LCM_LEAF_CHUNK_TOKENS", "1000");
+      const log = recordingLog();
+      const run = await startIncrementalRun("expired-after-wait", log);
+      const captureTranscript = SessionCapture.prototype.captureTranscript;
+      const earlyCaptured = Promise.withResolvers<void>();
+      const holding = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      let captures = 0;
+      const capture = vi.spyOn(SessionCapture.prototype, "captureTranscript").mockImplementation(
+        async function (this: SessionCapture, ...args: Parameters<SessionCapture["captureTranscript"]>) {
+          captures += 1;
+          const attempt = captures;
+          // The second Capture, after the wait, holds the lease the mark needs.
+          if (attempt === 2) {
+            holding.resolve();
+            await release.promise;
+          }
+          const captured = await captureTranscript.apply(this, args);
+          if (attempt === 1) earlyCaptured.resolve();
+          return captured;
+        });
+      const { res, replied } = replyRecorder();
+      fakeHandlerTimers();
+      const precompact = run.handler(request, res, JSON.stringify({
+        session_id: "expired-after-wait", cwd: run.cwd, transcript_path: run.transcriptPath,
+        capture_required: true, reply_budget_ms: 600_000,
+      }));
+      try {
+        await earlyCaptured.promise;
+        run.resume.resolve();
+        await run.incremental;
+        await holding.promise;
+        await vi.advanceTimersByTimeAsync(600_000);
+        expect(res.end).toHaveBeenCalledTimes(1);
+        const reply = await replied;
+        expect(reply.status).toBe(202);
+        expect(reply.body).toMatchObject({
+          captureOutcome: { status: "completed", messages: 1 },
+          summaryOutcome: { status: "deferred", reason: "budget-expired" },
+        });
+      } finally {
+        release.resolve();
+        run.resume.resolve();
+        await run.incremental;
+        await precompact;
+        capture.mockRestore();
+        vi.useRealTimers();
+        vi.unstubAllEnvs();
+      }
+      expect(res.end).toHaveBeenCalledTimes(1);
+      // Back from its Capture past the budget, the main path logs no second deferral.
+      expect(deferrals(log)).toEqual([expect.objectContaining({ reason: "budget-expired" })]);
+    }, 15_000);
+
+    // A PreCompact that waited out an incremental run, past its early Capture and arm: its second
+    // Capture stores `rows` rows the transcript gained meanwhile, and its own summary then keeps
+    // the lease after its first leaf until `finish`.
+    async function precompactAfterIncrementalRun(sessionId: string, rows: number) {
+      const log = recordingLog();
+      const run = await startIncrementalRun(sessionId, log);
+      const captureTranscript = SessionCapture.prototype.captureTranscript;
+      const earlyCaptured = Promise.withResolvers<void>();
+      let captures = 0;
+      const capture = vi.spyOn(SessionCapture.prototype, "captureTranscript").mockImplementation(
+        async function (this: SessionCapture, ...args: Parameters<SessionCapture["captureTranscript"]>) {
+          captures += 1;
+          const attempt = captures;
+          if (attempt === 2) appendFileSync(run.transcriptPath, Array.from({ length: rows }, (_row, index) => JSON.stringify({
+            message: { role: index % 2 ? "assistant" : "user", content: `row ${index} after the wait ${"content for compaction ".repeat(100)}` },
+          }) + "\n").join(""));
+          const captured = await captureTranscript.apply(this, args);
+          if (attempt === 1) earlyCaptured.resolve();
+          return captured;
+        });
+      const holding = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const replaceRange = SummaryStore.prototype.replaceContextRangeWithSummary;
+      let held = false;
+      const publish = vi.spyOn(SummaryStore.prototype, "replaceContextRangeWithSummary").mockImplementation(
+        async function (this: SummaryStore, ...args: Parameters<SummaryStore["replaceContextRangeWithSummary"]>) {
+          await replaceRange.apply(this, args);
+          // Only the PreCompact's own summary publishes after its second Capture.
+          if (captures === 2 && !held) {
+            held = true;
+            holding.resolve();
+            await release.promise;
+          }
+        });
+      const { res, replied } = replyRecorder();
+      fakeHandlerTimers();
+      const precompact = run.handler(request, res, JSON.stringify({
+        session_id: sessionId, cwd: run.cwd, transcript_path: run.transcriptPath,
+        capture_required: true, reply_budget_ms: 600_000,
+      }));
+      await earlyCaptured.promise;
+      run.resume.resolve();
+      await run.incremental;
+      const finish = async () => {
+        release.resolve();
+        await precompact;
+        capture.mockRestore();
+        publish.mockRestore();
+      };
+      return { cwd: run.cwd, log, res, replied, holding: holding.promise, finish };
+    }
+
+    it("re-arms at the second Capture, so the 202 reports what both Captures stored", async () => {
+      vi.stubEnv("LCM_LEAF_CHUNK_TOKENS", "1000");
+      const precompact = await precompactAfterIncrementalRun("expired-rearmed", 4);
+      try {
+        await precompact.holding;
+        // The timer fires 3 s before the budget ends; the mark then waits out the margin for the lease.
+        await vi.advanceTimersByTimeAsync(600_000 - 1);
+        expect(precompact.res.end).not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(1);
+        const reply = await precompact.replied;
+        expect(reply.status).toBe(202);
+        expect(reply.body).toMatchObject({
+          // The early Capture's tail row and the 4 rows the second Capture found.
+          captureOutcome: { status: "completed", messages: 5 },
+          summaryOutcome: { status: "deferred", reason: "budget-expired" },
+        });
+      } finally {
+        await precompact.finish();
+      }
+      expect(precompact.res.end).toHaveBeenCalledTimes(1);
+      expect(deferrals(precompact.log)).toEqual([expect.objectContaining({
+        session_id: "expired-rearmed", reason: "budget-expired", budget_ms: 600_000, elapsed_ms: 600_000,
+      })]);
+    }, 15_000);
+
+    it("leaves the session unmarked when the timer fires after an over-budget 202", async () => {
+      vi.stubEnv("LCM_LEAF_CHUNK_TOKENS", "1000");
+      // The early Capture's estimate fits and arms the timer; with the rows found after the wait it does
+      // not. Summarizing those rows (about 24 leaves) after the release makes this test a slow one.
+      const precompact = await precompactAfterIncrementalRun("over-budget-after-arm", 40);
+      try {
+        const reply = await precompact.replied;
+        expect(reply.status).toBe(202);
+        expect(reply.body).toMatchObject({ summaryOutcome: { status: "deferred", reason: "over-budget" } });
+        await precompact.holding;
+        // Past the timer's instant and the over-budget mark's 30 s, while the summary still runs.
+        await vi.advanceTimersByTimeAsync(600_000);
+      } finally {
+        await precompact.finish();
+      }
+      expect(precompact.res.end).toHaveBeenCalledTimes(1);
+      expect(deferrals(precompact.log)).toEqual([expect.objectContaining({
+        session_id: "over-budget-after-arm", reason: "over-budget", estimated_calls: expect.any(Number),
+      })]);
+      expect(precompact.log.write).not.toHaveBeenCalledWith("warn", "precompact.mark_failed", expect.anything());
+      // Read on the handler's clock, still faked: a restore this late is an ordinary session start.
+      expect(justCompacted(precompact.cwd, "over-budget-after-arm")).toBe(false);
+    }, 30_000);
+
+    it("does not mark the session again when its summary ends after a budget-expired 202", async () => {
+      const cwd = mkdtempSync(join(tmpdir(), "lcm-budget-expired-once-"));
+      dirs.push(cwd);
+      const transcriptPath = writeBacklog(cwd, "expired-once");
+      const entered = Promise.withResolvers<void>();
+      const resume = Promise.withResolvers<void>();
+      vi.mocked(createOpenAISummarizer).mockReturnValueOnce(async () => {
+        entered.resolve();
+        await resume.promise;
+        return "summary finished long after the reply";
+      });
+      const { res, replied } = replyRecorder();
+      fakeHandlerTimers();
+      const compacting = createCompactHandler(makeConfig("openai"), paths)(request, res, JSON.stringify({
+        session_id: "expired-once", cwd, transcript_path: transcriptPath, capture_required: true, reply_budget_ms: 600_000,
+      }));
+      try {
+        await Promise.race([entered.promise, compacting.then(() => { throw new Error("handler ended before its model call"); })]);
+        await vi.advanceTimersByTimeAsync(600_000 - 3_000);
+        expect((await replied).status).toBe(202);
+        expect(justCompacted(cwd, "expired-once")).toBe(true);
+        // The summary outlives the timer's mark, so any mark left after it ends is the run's own.
+        await vi.advanceTimersByTimeAsync(60_000);
+        expect(justCompacted(cwd, "expired-once")).toBe(false);
+      } finally {
+        resume.resolve();
+        await compacting;
+      }
+      expect(await readSummaryCount(cwd, "expired-once")).toBeGreaterThan(0);
+      // Read on the handler's clock, still faked: a restore this late is an ordinary session start.
+      expect(justCompacted(cwd, "expired-once")).toBe(false);
+    }, 15_000);
+
+    it("counts the budget from the request's start, not from the end of Capture", async () => {
+      const cwd = mkdtempSync(join(tmpdir(), "lcm-budget-from-start-"));
+      dirs.push(cwd);
+      const transcriptPath = writeBacklog(cwd, "from-start");
+      const entered = Promise.withResolvers<void>();
+      const resume = Promise.withResolvers<void>();
+      vi.mocked(createOpenAISummarizer).mockReturnValueOnce(async () => {
+        entered.resolve();
+        await resume.promise;
+        return "summary of a slowly captured backlog";
+      });
+      const captureTranscript = SessionCapture.prototype.captureTranscript;
+      const capture = vi.spyOn(SessionCapture.prototype, "captureTranscript").mockImplementation(
+        async function (this: SessionCapture, ...args: Parameters<SessionCapture["captureTranscript"]>) {
+          // A long transcript: Capture spends 20 s of the budget before the timer is armed.
+          vi.setSystemTime(Date.now() + 20_000);
+          return captureTranscript.apply(this, args);
+        });
+      const log = recordingLog();
+      const { res, replied } = replyRecorder();
+      fakeHandlerTimers();
+      const compacting = createCompactHandler(makeConfig("openai"), paths, undefined, log)(request, res, JSON.stringify({
+        session_id: "from-start", cwd, transcript_path: transcriptPath, capture_required: true, reply_budget_ms: 600_000,
+      }));
+      try {
+        await Promise.race([entered.promise, compacting.then(() => { throw new Error("handler ended before its model call"); })]);
+        await vi.advanceTimersByTimeAsync(600_000 - 3_000 - 20_000 - 1);
+        expect(res.end).not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(1);
+        expect(res.end).toHaveBeenCalledTimes(1);
+        expect((await replied).status).toBe(202);
+      } finally {
+        resume.resolve();
+        await compacting;
+        capture.mockRestore();
+      }
+      expect(deferrals(log)).toEqual([expect.objectContaining({
+        session_id: "from-start", reason: "budget-expired", elapsed_ms: 600_000 - 3_000,
+      })]);
+    }, 15_000);
+
+    it("clears the timer once an in-budget summary has answered 200", async () => {
+      const cwd = mkdtempSync(join(tmpdir(), "lcm-budget-in-time-"));
+      dirs.push(cwd);
+      const transcriptPath = writeBacklog(cwd, "in-time");
+      vi.mocked(createOpenAISummarizer).mockReturnValueOnce(async () => "summary within the budget");
+      const log = recordingLog();
+      const { res, replied } = replyRecorder();
+      fakeHandlerTimers();
+      try {
+        await createCompactHandler(makeConfig("openai"), paths, undefined, log)(request, res, JSON.stringify({
+          session_id: "in-time", cwd, transcript_path: transcriptPath, capture_required: true, reply_budget_ms: 600_000,
+        }));
+        expect((await replied).status).toBe(200);
+        expect(vi.getTimerCount()).toBe(0);
+        await vi.advanceTimersByTimeAsync(600_000);
+      } finally {
+        vi.useRealTimers();
+      }
+      expect(res.end).toHaveBeenCalledTimes(1);
+      expect(log.write).not.toHaveBeenCalledWith("info", "precompact.deferred", expect.anything());
+    });
+
+    it("leaves a request without reply_budget_ms waiting for its summary", async () => {
+      const cwd = mkdtempSync(join(tmpdir(), "lcm-budget-none-"));
+      dirs.push(cwd);
+      const transcriptPath = writeBacklog(cwd, "no-budget");
+      const entered = Promise.withResolvers<void>();
+      const resume = Promise.withResolvers<void>();
+      vi.mocked(createOpenAISummarizer).mockReturnValueOnce(async () => {
+        entered.resolve();
+        await resume.promise;
+        return "summary without a budget";
+      });
+      const { res, replied } = replyRecorder();
+      fakeHandlerTimers();
+      const compacting = createCompactHandler(makeConfig("openai"), paths)(request, res, JSON.stringify({
+        session_id: "no-budget", cwd, transcript_path: transcriptPath, capture_required: true,
+      }));
+      try {
+        await Promise.race([entered.promise, compacting.then(() => { throw new Error("handler ended before its model call"); })]);
+        await vi.advanceTimersByTimeAsync(30 * 60_000);
+        expect(res.end).not.toHaveBeenCalled();
+      } finally {
+        resume.resolve();
+        await compacting;
+        vi.useRealTimers();
+      }
+      const reply = await replied;
+      expect(reply.status).toBe(200);
+      expect(reply.body.summaryOutcome).toMatchObject({ status: "completed" });
+    }, 15_000);
+  });
 
   it("backs the live leaf trigger off a session whose unforced run failed", async () => {
     vi.stubEnv("LCM_LEAF_CHUNK_TOKENS", "1000");
